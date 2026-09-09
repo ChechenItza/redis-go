@@ -2,29 +2,78 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"os"
 )
 
-func handle(conn net.Conn, s *InMemory) {
-	defer conn.Close()
+type Response struct {
+	v   []byte
+	err error
+}
+
+func safely(cancel context.CancelFunc, fn func()) {
+	defer cancel()
 	defer func() {
-		err := recover()
-		if err != nil {
+		if err := recover(); err != nil {
 			fmt.Println("recovered from: ", err)
 		}
 	}()
 
+	fn()
+}
+
+func handle(ctx context.Context, conn net.Conn, s *InMemory, ps *PubSub) {
+	ctx, cancel := context.WithCancel(ctx)
+	cs := NewConnState(ctx, s, ps)
+
+	defer conn.Close()
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println("recovered from: ", err)
+		}
+	}()
+	defer cancel()
+	defer cs.Teardown()
+
 	reader := bufio.NewReader(conn)
-	b := NewBackend(s)
+
+	resCh := make(chan Response)
+	go safely(cancel, func() {
+		for {
+			res, err := cs.Interpret(reader)
+			select {
+			case resCh <- Response{v: res, err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+	go safely(cancel, func() {
+		for {
+			res, err := cs.Listen()
+			select {
+			case resCh <- Response{v: res, err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+
 	for {
-		res, err := b.Interpret(reader)
-		if err != nil {
+		var res Response
+		select {
+		case res = <-resCh:
+		case <-ctx.Done():
 			return
 		}
 
-		_, err = conn.Write(res)
+		if res.err != nil {
+			return
+		}
+
+		_, err := conn.Write(res.v)
 		if err != nil {
 			fmt.Println("Error writing message: ", err.Error())
 			return
@@ -42,6 +91,8 @@ func main() {
 	}
 
 	s := NewInMemory()
+	ps := NewPubSub()
+	ctx := context.Background()
 
 	for {
 		conn, err := l.Accept()
@@ -50,6 +101,6 @@ func main() {
 			continue
 		}
 
-		go handle(conn, s)
+		go handle(ctx, conn, s, ps)
 	}
 }

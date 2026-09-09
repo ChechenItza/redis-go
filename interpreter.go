@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"slices"
 	"strconv"
@@ -9,29 +10,35 @@ import (
 	"time"
 )
 
+const SubBufferSize = 128
+
 var SimpleParsingErr = SimpleError(ErrParsing.Error())
 
 type CmdSpec struct {
-	arity   func(args InArray) bool
-	handler func(b *Backend, args InArray) Value
-	isTxCmd bool
+	arity       func(args InArray) bool
+	handler     func(b *ConnState, args InArray) Value
+	isTxCmd     bool
+	isPubSubCmd bool
 }
 
 var commands = map[string]CmdSpec{
-	"echo":    {arity: exact(1), handler: (*Backend).echo, isTxCmd: false},
-	"ping":    {arity: exact(0), handler: (*Backend).ping, isTxCmd: false},
-	"set":     {arity: oneOf(2, 4), handler: (*Backend).set, isTxCmd: false},
-	"get":     {arity: exact(1), handler: (*Backend).get, isTxCmd: false},
-	"incr":    {arity: exact(1), handler: (*Backend).incr, isTxCmd: false},
-	"multi":   {arity: exact(0), handler: (*Backend).multi, isTxCmd: true},
-	"exec":    {arity: exact(0), handler: (*Backend).exec, isTxCmd: true},
-	"discard": {arity: exact(0), handler: (*Backend).discard, isTxCmd: true},
-	"rpush":   {arity: atLeast(2), handler: (*Backend).rpush, isTxCmd: false},
-	"lrange":  {arity: exact(3), handler: (*Backend).lrange, isTxCmd: false},
-	"lpush":   {arity: atLeast(2), handler: (*Backend).lpush, isTxCmd: false},
-	"llen":    {arity: exact(1), handler: (*Backend).llen, isTxCmd: false},
-	"lpop":    {arity: oneOf(1, 2), handler: (*Backend).lpop, isTxCmd: false},
-	"blpop":   {arity: exact(2), handler: (*Backend).blpop, isTxCmd: false},
+	"echo":        {arity: exact(1), handler: (*ConnState).echo},
+	"ping":        {arity: exact(0), handler: (*ConnState).ping, isPubSubCmd: true},
+	"set":         {arity: oneOf(2, 4), handler: (*ConnState).set},
+	"get":         {arity: exact(1), handler: (*ConnState).get},
+	"incr":        {arity: exact(1), handler: (*ConnState).incr},
+	"multi":       {arity: exact(0), handler: (*ConnState).multi, isTxCmd: true},
+	"exec":        {arity: exact(0), handler: (*ConnState).exec, isTxCmd: true},
+	"discard":     {arity: exact(0), handler: (*ConnState).discard, isTxCmd: true},
+	"rpush":       {arity: atLeast(2), handler: (*ConnState).rpush},
+	"lrange":      {arity: exact(3), handler: (*ConnState).lrange},
+	"lpush":       {arity: atLeast(2), handler: (*ConnState).lpush},
+	"llen":        {arity: exact(1), handler: (*ConnState).llen},
+	"lpop":        {arity: oneOf(1, 2), handler: (*ConnState).lpop},
+	"blpop":       {arity: exact(2), handler: (*ConnState).blpop},
+	"subscribe":   {arity: exact(1), handler: (*ConnState).subscribe, isPubSubCmd: true},
+	"publish":     {arity: exact(2), handler: (*ConnState).publish, isPubSubCmd: true},
+	"unsubscribe": {arity: exact(1), handler: (*ConnState).unsubscribe, isPubSubCmd: true},
 }
 
 func exact(n int) func(args InArray) bool {
@@ -68,22 +75,35 @@ func bulkStrings(bs [][]byte) Array {
 	return res
 }
 
-type Backend struct {
+type ConnState struct {
 	storage *InMemory
 	txQueue []func() Value
+	pubsub  *PubSub
+	ctx     context.Context
+
+	isSubState    bool
+	subscriber    *Subscriber
+	subscriptions map[string]struct{}
 }
 
-func NewBackend(st *InMemory) *Backend {
-	return &Backend{
+func NewConnState(ctx context.Context, st *InMemory, ps *PubSub) *ConnState {
+	return &ConnState{
 		storage: st,
+		pubsub:  ps,
+		ctx:     ctx,
+		subscriber: &Subscriber{
+			ch:   make(chan Message, SubBufferSize),
+			dead: make(chan struct{}),
+		},
+		subscriptions: make(map[string]struct{}),
 	}
 }
 
-func (b *Backend) Interpret(r *bufio.Reader) ([]byte, error) {
+func (b *ConnState) Interpret(r *bufio.Reader) ([]byte, error) {
 	arr, err := Decode(r)
 	if err != nil {
 		if errors.Is(err, ErrParsing) {
-			return Encode(SimpleParsingErr), nil
+			return SimpleParsingErr.encode(), nil
 		}
 
 		return nil, err
@@ -92,33 +112,41 @@ func (b *Backend) Interpret(r *bufio.Reader) ([]byte, error) {
 	cmdStr := strings.ToLower(string(arr[0]))
 	cmd, ok := commands[cmdStr]
 	if !ok {
-		return Encode(SimpleParsingErr), nil
+		return SimpleParsingErr.encode(), nil
 	}
 
 	if !cmd.arity(arr[1:]) {
-		return Encode(SimpleParsingErr), nil
+		return SimpleParsingErr.encode(), nil
 	}
 
 	if b.txQueue != nil && !cmd.isTxCmd {
 		b.txQueue = append(b.txQueue, func() Value {
 			return cmd.handler(b, arr)
 		})
-		return Encode(SimpleString("QUEUED")), nil
+		return SimpleString("QUEUED").encode(), nil
+	}
+
+	if b.isSubState && !cmd.isPubSubCmd {
+		return SimpleError("Can't execute '" + cmdStr + "'").encode(), nil
 	}
 
 	res := cmd.handler(b, arr)
-	return Encode(res), nil
+	return res.encode(), nil
 }
 
-func (b *Backend) echo(args InArray) Value {
+func (b *ConnState) echo(args InArray) Value {
 	return args[1]
 }
 
-func (b *Backend) ping(_ InArray) Value {
+func (b *ConnState) ping(_ InArray) Value {
+	if b.isSubState {
+		return Array([]Value{BulkString("pong"), BulkString("")})
+	}
+
 	return SimpleString("PONG")
 }
 
-func (b *Backend) set(args InArray) Value {
+func (b *ConnState) set(args InArray) Value {
 	k := string(args[1])
 	v := []byte(args[2])
 	var ttl *time.Duration
@@ -145,7 +173,7 @@ func (b *Backend) set(args InArray) Value {
 	return SimpleString("OK")
 }
 
-func (b *Backend) get(args InArray) Value {
+func (b *ConnState) get(args InArray) Value {
 	k := string(args[1])
 	v, err := b.storage.get(k)
 	if err != nil {
@@ -155,7 +183,7 @@ func (b *Backend) get(args InArray) Value {
 	return BulkString(v)
 }
 
-func (b *Backend) incr(args InArray) Value {
+func (b *ConnState) incr(args InArray) Value {
 	k := string(args[1])
 
 	v, err := b.storage.increase(k)
@@ -166,7 +194,7 @@ func (b *Backend) incr(args InArray) Value {
 	return Integer(v)
 }
 
-func (b *Backend) multi(_ InArray) Value {
+func (b *ConnState) multi(_ InArray) Value {
 	if b.txQueue != nil {
 		return SimpleError("recusive transactions are not allowed")
 	}
@@ -175,7 +203,7 @@ func (b *Backend) multi(_ InArray) Value {
 	return SimpleString("OK")
 }
 
-func (b *Backend) exec(_ InArray) Value {
+func (b *ConnState) exec(_ InArray) Value {
 	if b.txQueue == nil {
 		return SimpleError("EXEC without MULTI")
 	}
@@ -190,7 +218,7 @@ func (b *Backend) exec(_ InArray) Value {
 	return res
 }
 
-func (b *Backend) discard(_ InArray) Value {
+func (b *ConnState) discard(_ InArray) Value {
 	if b.txQueue == nil {
 		return SimpleError("DISCARD without MULTI")
 	}
@@ -199,7 +227,7 @@ func (b *Backend) discard(_ InArray) Value {
 	return SimpleString("OK")
 }
 
-func (b *Backend) rpush(args InArray) Value {
+func (b *ConnState) rpush(args InArray) Value {
 	k := string(args[1])
 	v := toByteSlices(args[2:])
 
@@ -211,7 +239,7 @@ func (b *Backend) rpush(args InArray) Value {
 	return Integer(n)
 }
 
-func (b *Backend) lrange(args InArray) Value {
+func (b *ConnState) lrange(args InArray) Value {
 	k := string(args[1])
 	startBytes := args[2]
 	endBytes := args[3]
@@ -234,7 +262,7 @@ func (b *Backend) lrange(args InArray) Value {
 	return bulkStrings(arr)
 }
 
-func (b *Backend) lpush(args InArray) Value {
+func (b *ConnState) lpush(args InArray) Value {
 	k := string(args[1])
 	v := toByteSlices(args[2:])
 
@@ -246,7 +274,7 @@ func (b *Backend) lpush(args InArray) Value {
 	return Integer(n)
 }
 
-func (b *Backend) llen(args InArray) Value {
+func (b *ConnState) llen(args InArray) Value {
 	k := string(args[1])
 
 	n, err := b.storage.llen(k)
@@ -257,7 +285,7 @@ func (b *Backend) llen(args InArray) Value {
 	return Integer(n)
 }
 
-func (b *Backend) lpop(args InArray) Value {
+func (b *ConnState) lpop(args InArray) Value {
 	k := string(args[1])
 	if len(args) > 2 {
 		iStr := args[2]
@@ -282,25 +310,87 @@ func (b *Backend) lpop(args InArray) Value {
 	return BulkString(n)
 }
 
-func (b *Backend) blpop(args InArray) Value {
+func (b *ConnState) blpop(args InArray) Value {
 	k := string(args[1])
 	ttlSec, err := strconv.ParseFloat(string(args[2]), 64)
 	if err != nil {
 		return SimpleError(ErrInvalidInt.Error())
 	}
 
-	v, ch, err := b.storage.blpop(k, time.Duration(ttlSec*float64(time.Second)))
+	v, err := b.storage.blpop(b.ctx, k, time.Duration(ttlSec*float64(time.Second)))
 	if err != nil {
 		return SimpleError(err.Error())
 	}
-
-	if ch != nil {
-		v = <-ch
-	}
-
 	if v == nil {
 		return Array(nil)
 	}
 
 	return Array([]Value{args[1], BulkString(v)})
+}
+
+func (b *ConnState) subscribe(args InArray) Value {
+	channel := string(args[1])
+
+	b.isSubState = true
+
+	b.pubsub.subscribe(channel, b.subscriber)
+	b.subscriptions[channel] = struct{}{}
+
+	return Array(
+		[]Value{BulkString("subscribe"),
+			BulkString(channel),
+			Integer(len(b.subscriptions))},
+	)
+}
+
+func (b *ConnState) publish(args InArray) Value {
+	channel := string(args[1])
+	msg := args[2]
+
+	n, err := b.pubsub.publish(channel, msg)
+	if err != nil {
+		return SimpleError(err.Error())
+	}
+
+	return Integer(n)
+}
+
+func (b *ConnState) unsubscribe(args InArray) Value {
+	channel := string(args[1])
+	if !b.isSubState {
+		return SimpleError(ErrNeverSubscribed.Error())
+	}
+
+	b.pubsub.unsubscribe(channel, b.subscriber)
+	delete(b.subscriptions, channel)
+
+	if len(b.subscriptions) == 0 {
+		b.isSubState = false
+	}
+
+	return Array(
+		[]Value{BulkString("unsubscribe"),
+			BulkString(channel),
+			Integer(len(b.subscriptions))},
+	)
+}
+
+func (b *ConnState) Listen() ([]byte, error) {
+	select {
+	case msg := <-b.subscriber.ch:
+		return Array(
+			[]Value{
+				BulkString("message"),
+				BulkString(msg.channel),
+				BulkString(msg.v),
+			},
+		).encode(), nil
+	case <-b.subscriber.dead:
+		return nil, ErrSubBuffExceeded
+	}
+}
+
+func (b *ConnState) Teardown() {
+	b.subscriber.kill()
+	b.pubsub.unsubscribeFromAll(b.subscriber)
 }

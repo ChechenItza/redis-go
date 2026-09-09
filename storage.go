@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"slices"
 	"strconv"
 	"sync"
@@ -110,7 +111,7 @@ func (im *InMemory) rpush(k string, v [][]byte) (int, error) {
 	im.st[k] = l
 	n := l.len
 
-	im.wakeWaiters(k)
+	im.sendAll(k)
 
 	return n, nil
 }
@@ -176,14 +177,14 @@ func (im *InMemory) lpush(k string, v [][]byte) (int, error) {
 	im.st[k] = l
 	n := l.len
 
-	im.wakeWaiters(k)
+	im.sendAll(k)
 
 	return n, nil
 }
 
 func (im *InMemory) llen(k string) (int, error) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
+	im.mu.RLock()
+	defer im.mu.RUnlock()
 
 	l, ok, err := getLive[List](im, k)
 	if err != nil {
@@ -195,6 +196,21 @@ func (im *InMemory) llen(k string) (int, error) {
 	}
 
 	return l.len, nil
+}
+
+func (im *InMemory) popFront(k string, l List) []byte {
+	res := l.root.v
+	if l.root.next == nil {
+		delete(im.st, k)
+		return res
+	}
+
+	l.root = l.root.next
+	l.root.prev = nil
+	l.len -= 1
+	im.st[k] = l
+
+	return res
 }
 
 func (im *InMemory) lpop(k string) ([]byte, error) {
@@ -210,18 +226,7 @@ func (im *InMemory) lpop(k string) ([]byte, error) {
 		return nil, nil
 	}
 
-	res := l.root.v
-	if l.root.next == nil {
-		delete(im.st, k)
-		return res, nil
-	}
-
-	l.root = l.root.next
-	l.root.prev = nil
-	l.len -= 1
-	im.st[k] = l
-
-	return res, nil
+	return im.popFront(k, l), nil
 }
 
 func (im *InMemory) lpopN(k string, n int) ([][]byte, error) {
@@ -255,7 +260,7 @@ func (im *InMemory) lpopN(k string, n int) ([][]byte, error) {
 	return res, nil
 }
 
-func (im *InMemory) blpop(k string, ttl time.Duration) ([]byte, chan []byte, error) {
+func (im *InMemory) lpopOrEnqueue(k string) ([]byte, chan []byte, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
@@ -264,75 +269,81 @@ func (im *InMemory) blpop(k string, ttl time.Duration) ([]byte, chan []byte, err
 		return nil, nil, err
 	}
 
-	if !ok {
-		ch := make(chan []byte, 1)
-		im.blpopQueue[k] = append(im.blpopQueue[k], ch)
-
-		if ttl != 0 {
-			time.AfterFunc(ttl, func() {
-				im.mu.Lock()
-				defer im.mu.Unlock()
-
-				won := im.removeWaiter(k, ch)
-				if won {
-					ch <- nil
-				}
-			})
-		}
-
-		return nil, ch, nil
+	if ok {
+		return im.popFront(k, l), nil, nil
 	}
 
-	res := l.root.v
-	if l.root.next == nil {
-		delete(im.st, k)
-		return res, nil, nil
-	}
+	ch := make(chan []byte, 1)
+	im.blpopQueue[k] = append(im.blpopQueue[k], ch)
 
-	l.root = l.root.next
-	l.root.prev = nil
-	l.len -= 1
-	im.st[k] = l
-
-	return res, nil, nil
+	return nil, ch, nil
 }
 
-func (im *InMemory) wakeWaiters(k string) {
-	for len(im.blpopQueue[k]) > 0 {
+func (im *InMemory) bdequeue(k string, ch chan []byte) bool {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	return im.dequeue(k, ch)
+}
+
+func (im *InMemory) blpop(ctx context.Context, k string, ttl time.Duration) ([]byte, error) {
+	res, ch, err := im.lpopOrEnqueue(k)
+	if res != nil || err != nil {
+		return res, err
+	}
+
+	if ttl != 0 {
+		time.AfterFunc(ttl, func() {
+			won := im.bdequeue(k, ch)
+			if won {
+				ch <- nil
+			}
+		})
+	}
+
+	select {
+	case res = <-ch:
+		return res, nil
+	case <-ctx.Done():
+		if im.bdequeue(k, ch) {
+			return nil, nil
+		}
+		return <-ch, nil
+	}
+}
+
+func (im *InMemory) sendAll(k string) {
+	i := 0
+	for i < len(im.blpopQueue[k]) {
 		l, ok, _ := getLive[List](im, k)
 		if !ok {
 			break
 		}
 
-		ch := im.blpopQueue[k][0]
-		im.blpopQueue[k] = im.blpopQueue[k][1:]
-
-		res := l.root.v
-		if l.root.next == nil {
-			delete(im.st, k)
-		} else {
-			l.root = l.root.next
-			l.root.prev = nil
-			l.len -= 1
-			im.st[k] = l
-		}
-
+		res := im.popFront(k, l)
+		ch := im.blpopQueue[k][i]
 		ch <- res
+
+		i += 1
 	}
 
-	if len(im.blpopQueue[k]) == 0 {
+	if i == len(im.blpopQueue[k]) {
 		delete(im.blpopQueue, k)
+	} else {
+		im.blpopQueue[k] = slices.Delete(im.blpopQueue[k], 0, i)
 	}
 }
 
-func (im *InMemory) removeWaiter(k string, ch chan []byte) bool {
+func (im *InMemory) dequeue(k string, ch chan []byte) bool {
 	q := im.blpopQueue[k]
 	for i, c := range q {
 		if c == ch {
-			im.blpopQueue[k] = append(q[:i], q[i+1:]...)
-			if len(im.blpopQueue[k]) == 0 {
+			if len(im.blpopQueue[k]) == 1 {
 				delete(im.blpopQueue, k)
+			} else {
+				im.blpopQueue[k] = slices.Delete(im.blpopQueue[k], i, i+1)
 			}
+
 			return true
 		}
 	}

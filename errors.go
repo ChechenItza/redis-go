@@ -12,4 +12,10 @@ var (
 	ErrBadLength     = fmt.Errorf("unparsable length: %w", ErrParsing)
 	ErrInvalidInt    = fmt.Errorf("value is not an integer or out of range")
 	ErrWrongType     = fmt.Errorf("incorrect type")
+
+	ErrNoChannel         = fmt.Errorf("channel doesn't exist")
+	ErrAlreadySubscribed = fmt.Errorf("already subscribed")
+	ErrNeverSubscribed   = fmt.Errorf("never even subscribed")
+
+	ErrSubBuffExceeded = fmt.Errorf("client output buffer exceeded")
 )

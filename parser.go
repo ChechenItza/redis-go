@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"strconv"
-	"strings"
 )
 
 const Separator = "\r\n"
@@ -60,7 +59,7 @@ func parseArray(r *bufio.Reader) (InArray, error) {
 	}
 
 	res := make([]BulkString, 0, n)
-	for range n {
+	for i := 0; i < n; i++ {
 		bs, err := parseBulkString(r)
 		if err != nil {
 			return nil, err
@@ -92,55 +91,4 @@ func parseBulkString(r *bufio.Reader) (BulkString, error) {
 	}
 
 	return bs, nil
-}
-
-func Encode(v Value) []byte {
-	switch cv := v.(type) {
-	case Array:
-		return encodeArray(cv)
-	case BulkString:
-		return encodeBulkString(cv)
-	case Integer:
-		return encodeInteger(cv)
-	case SimpleString:
-		return encodeSimpleString(cv)
-	case SimpleError:
-		return encodeSimpleError(cv)
-	default:
-		return nil
-	}
-}
-
-func encodeArray(arr Array) []byte {
-	if arr == nil {
-		return []byte("*-1\r\n")
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "*%d%s", len(arr), Separator)
-
-	for _, v := range arr {
-		b.Write(Encode(v))
-	}
-
-	return []byte(b.String())
-}
-
-func encodeBulkString(bs BulkString) []byte {
-	if bs == nil {
-		return []byte("$-1\r\n")
-	}
-	return fmt.Appendf(nil, "$%d%s%s%s", len(bs), Separator, bs, Separator)
-}
-
-func encodeSimpleString(ss SimpleString) []byte {
-	return fmt.Appendf(nil, "+%s%s", ss, Separator)
-}
-
-func encodeInteger(i Integer) []byte {
-	return fmt.Appendf(nil, ":%d%s", i, Separator)
-}
-
-func encodeSimpleError(err SimpleError) []byte {
-	return fmt.Appendf(nil, "-ERR %s%s", err, Separator)
 }
