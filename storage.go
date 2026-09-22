@@ -6,24 +6,11 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/chechenitza/redis-go/app/list"
+	sset "github.com/chechenitza/redis-go/app/sortedset"
+	str "github.com/chechenitza/redis-go/app/string"
 )
-
-type List struct {
-	root *Node
-	tail *Node
-	len  int
-}
-
-type Node struct {
-	v    []byte
-	next *Node
-	prev *Node
-}
-
-type storageValue struct {
-	v         []byte
-	expiresAt time.Time
-}
 
 type InMemory struct {
 	mu         sync.RWMutex
@@ -42,52 +29,61 @@ func (im *InMemory) store(k string, v []byte, ttl *time.Duration) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	sv := storageValue{v: v}
+	s := str.New(v)
 	if ttl != nil {
-		sv.expiresAt = time.Now().Add(*ttl)
+		s.SetTTL(*ttl)
 	}
 
-	im.st[k] = sv
+	im.st[k] = s
 }
 
 func (im *InMemory) get(k string) ([]byte, error) {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
 
-	sv, ok, err := getLive[storageValue](im, k)
+	s, ok, err := getLive[*str.String](im, k)
 	if err != nil {
 		return nil, err
 	}
-
 	if !ok {
 		return nil, nil
 	}
 
-	return sv.v, nil
+	res, ok := s.Get()
+	if !ok {
+		return nil, nil
+	}
+
+	return res, nil
 }
 
 func (im *InMemory) increase(k string) (int, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	sv, ok, err := getLive[storageValue](im, k)
+	s, ok, err := getLive[*str.String](im, k)
 	if err != nil {
 		return -1, err
 	}
 
 	if !ok {
-		im.st[k] = storageValue{v: []byte{'1'}}
+		im.st[k] = str.New([]byte("1"))
 		return 1, nil
 	}
 
-	n, err := strconv.Atoi(string(sv.v))
+	res, ok := s.Get()
+	if !ok {
+		s.Set([]byte("1"))
+		return 1, nil
+	}
+
+	n, err := strconv.Atoi(string(res))
 	if err != nil {
 		return -1, ErrInvalidInt
 	}
 
-	sn := strconv.Itoa(n + 1)
-	sv.v = []byte(sn)
-	im.st[k] = sv
+	nStr := strconv.Itoa(n + 1)
+	s.Set([]byte(nStr))
 
 	return n + 1, nil
 }
@@ -96,20 +92,20 @@ func (im *InMemory) rpush(k string, v [][]byte) (int, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return -1, err
 	}
 
 	if !ok {
-		l = initList(v)
-	} else {
-		for _, bs := range v {
-			insertNode(&l, bs)
-		}
+		l = list.New()
+		im.st[k] = l
 	}
-	im.st[k] = l
-	n := l.len
+
+	for _, bs := range v {
+		l.Append(bs)
+	}
+	n := l.Len()
 
 	im.sendAll(k)
 
@@ -120,62 +116,34 @@ func (im *InMemory) lrange(k string, start int, end int) ([][]byte, error) {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return nil, err
 	}
-
-	res := make([][]byte, 0)
 	if !ok {
-		return res, nil
+		return nil, ErrNotFound
 	}
 
-	if start < 0 {
-		start = max(0, l.len+start)
-	}
-	if end < 0 {
-		end += l.len
-	}
-	if end >= l.len {
-		end = l.len - 1
-	}
-
-	if start > end {
-		return res, nil
-	}
-
-	curr := l.root
-	for i := 0; i < start; i++ {
-		curr = curr.next
-	}
-
-	for i := start; i <= end; i++ {
-		res = append(res, curr.v)
-		curr = curr.next
-	}
-
-	return res, nil
+	return l.Range(start, end)
 }
 
 func (im *InMemory) lpush(k string, v [][]byte) (int, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return -1, err
 	}
-
 	if !ok {
-		slices.Reverse(v)
-		l = initList(v)
-	} else {
-		for _, bs := range v {
-			prependNode(&l, bs)
-		}
+		l = list.New()
+		im.st[k] = l
 	}
-	im.st[k] = l
-	n := l.len
+
+	for _, bs := range v {
+		l.Prepend(bs)
+	}
+	n := l.Len()
 
 	im.sendAll(k)
 
@@ -186,7 +154,7 @@ func (im *InMemory) llen(k string) (int, error) {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return -1, err
 	}
@@ -195,29 +163,14 @@ func (im *InMemory) llen(k string) (int, error) {
 		return 0, nil
 	}
 
-	return l.len, nil
-}
-
-func (im *InMemory) popFront(k string, l List) []byte {
-	res := l.root.v
-	if l.root.next == nil {
-		delete(im.st, k)
-		return res
-	}
-
-	l.root = l.root.next
-	l.root.prev = nil
-	l.len -= 1
-	im.st[k] = l
-
-	return res
+	return l.Len(), nil
 }
 
 func (im *InMemory) lpop(k string) ([]byte, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return nil, err
 	}
@@ -226,14 +179,20 @@ func (im *InMemory) lpop(k string) ([]byte, error) {
 		return nil, nil
 	}
 
-	return im.popFront(k, l), nil
+	res, err := l.PopFront()
+
+	if l.Len() == 0 {
+		delete(im.st, k)
+	}
+
+	return res, err
 }
 
 func (im *InMemory) lpopN(k string, n int) ([][]byte, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return nil, err
 	}
@@ -242,20 +201,20 @@ func (im *InMemory) lpopN(k string, n int) ([][]byte, error) {
 		return nil, nil
 	}
 
-	res := make([][]byte, 0)
-	for range n {
-		res = append(res, l.root.v)
-
-		if l.root.next == nil {
-			delete(im.st, k)
-			return res, nil
+	count := min(n, l.Len())
+	res := make([][]byte, 0, count)
+	for range count {
+		v, err := l.PopFront()
+		if err != nil {
+			break
 		}
 
-		l.root = l.root.next
-		l.root.prev = nil
-		l.len -= 1
+		res = append(res, v)
 	}
-	im.st[k] = l
+
+	if l.Len() == 0 {
+		delete(im.st, k)
+	}
 
 	return res, nil
 }
@@ -264,13 +223,18 @@ func (im *InMemory) lpopOrEnqueue(k string) ([]byte, chan []byte, error) {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 
-	l, ok, err := getLive[List](im, k)
+	l, ok, err := getLive[*list.List](im, k)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	if ok {
-		return im.popFront(k, l), nil, nil
+		res, err := l.PopFront()
+		if l.Len() == 0 {
+			delete(im.st, k)
+		}
+
+		return res, nil, err
 	}
 
 	ch := make(chan []byte, 1)
@@ -315,12 +279,18 @@ func (im *InMemory) blpop(ctx context.Context, k string, ttl time.Duration) ([]b
 func (im *InMemory) sendAll(k string) {
 	i := 0
 	for i < len(im.blpopQueue[k]) {
-		l, ok, _ := getLive[List](im, k)
+		l, ok, _ := getLive[*list.List](im, k)
 		if !ok {
 			break
 		}
 
-		res := im.popFront(k, l)
+		res, err := l.PopFront()
+		if l.Len() == 0 {
+			delete(im.st, k)
+		}
+		if err != nil {
+			break
+		}
 		ch := im.blpopQueue[k][i]
 		ch <- res
 
@@ -350,14 +320,102 @@ func (im *InMemory) dequeue(k string, ch chan []byte) bool {
 	return false
 }
 
+func (im *InMemory) zadd(k string, score float64, name string) (int, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, k)
+	if err != nil {
+		return 0, err
+	}
+
+	if !exists {
+		ss = sset.New()
+		im.st[k] = ss
+	}
+
+	return ss.Upsert(name, score)
+}
+
+func (im *InMemory) zrank(key string, name string) (int, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, key)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNotFound
+	}
+
+	return ss.SearchRank(name)
+}
+
+func (im *InMemory) zrange(key string, i, j int) ([]string, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, key)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+
+	return ss.Range(i, j)
+}
+
+func (im *InMemory) zcard(key string) (int, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, key)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNotFound
+	}
+
+	return ss.Len(), nil
+}
+
+func (im *InMemory) zscore(key, member string) (float64, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, key)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNotFound
+	}
+
+	return ss.SearchByKey(member)
+}
+
+func (im *InMemory) zrem(key, member string) error {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	ss, exists, err := getLive[sset.SortedSet](im, key)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	return ss.Remove(member)
+}
+
 func getLive[T any](im *InMemory, k string) (T, bool, error) {
 	v, ok := im.st[k]
 	var zero T
 	if !ok {
-		return zero, false, nil
-	}
-
-	if sv, isStr := v.(storageValue); isStr && isExpired(sv.expiresAt) {
 		return zero, false, nil
 	}
 
@@ -367,47 +425,4 @@ func getLive[T any](im *InMemory, k string) (T, bool, error) {
 	}
 
 	return t, true, nil
-}
-
-func initList(v [][]byte) List {
-	node := &Node{v: v[0]}
-	l := List{
-		root: node,
-		tail: node,
-		len:  1,
-	}
-
-	for _, bs := range v[1:] {
-		insertNode(&l, bs)
-	}
-
-	return l
-}
-
-func insertNode(l *List, v []byte) {
-	node := &Node{
-		v:    v,
-		prev: l.tail,
-	}
-	l.tail.next = node
-	l.tail = node
-	l.len += 1
-}
-
-func prependNode(l *List, v []byte) {
-	node := &Node{
-		v:    v,
-		next: l.root,
-	}
-	l.root.prev = node
-	l.root = node
-	l.len += 1
-}
-
-func isExpired(t time.Time) bool {
-	if t.IsZero() {
-		return false
-	}
-
-	return t.Before(time.Now())
 }

@@ -1,4 +1,4 @@
-package main
+package resp
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 
 type Value interface {
 	isRespValue()
-	encode() []byte
+	Encode() []byte
 }
 
 type InArray []BulkString
@@ -25,7 +25,7 @@ func (Array) isRespValue()        {}
 func (InArray) isRespValue()      {}
 func (SimpleError) isRespValue()  {}
 
-func (arr Array) encode() []byte {
+func (arr Array) Encode() []byte {
 	if arr == nil {
 		return []byte("*-1\r\n")
 	}
@@ -34,32 +34,32 @@ func (arr Array) encode() []byte {
 	fmt.Fprintf(&b, "*%d%s", len(arr), Separator)
 
 	for _, v := range arr {
-		b.Write(v.encode())
+		b.Write(v.Encode())
 	}
 
 	return []byte(b.String())
 }
 
-func (bs BulkString) encode() []byte {
+func (bs BulkString) Encode() []byte {
 	if bs == nil {
 		return []byte("$-1\r\n")
 	}
 	return fmt.Appendf(nil, "$%d%s%s%s", len(bs), Separator, bs, Separator)
 }
 
-func (ss SimpleString) encode() []byte {
+func (ss SimpleString) Encode() []byte {
 	return fmt.Appendf(nil, "+%s%s", ss, Separator)
 }
 
-func (i Integer) encode() []byte {
+func (i Integer) Encode() []byte {
 	return fmt.Appendf(nil, ":%d%s", i, Separator)
 }
 
-func (err SimpleError) encode() []byte {
+func (err SimpleError) Encode() []byte {
 	return fmt.Appendf(nil, "-ERR %s%s", err, Separator)
 }
 
-func (arr InArray) encode() []byte {
+func (arr InArray) Encode() []byte {
 	if arr == nil {
 		return []byte("*-1\r\n")
 	}
@@ -68,7 +68,7 @@ func (arr InArray) encode() []byte {
 	fmt.Fprintf(&b, "*%d%s", len(arr), Separator)
 
 	for _, v := range arr {
-		b.Write(v.encode())
+		b.Write(v.Encode())
 	}
 
 	return []byte(b.String())

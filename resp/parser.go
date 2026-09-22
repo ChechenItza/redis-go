@@ -1,10 +1,12 @@
-package main
+package resp
 
 import (
 	"bufio"
 	"fmt"
 	"io"
 	"strconv"
+
+	"github.com/chechenitza/redis-go/app/common"
 )
 
 const Separator = "\r\n"
@@ -17,45 +19,13 @@ const ArrayMinElems = 1
 const BulkStringMaxBytes = 512_000_000
 const BulkStringMinBytes = 0
 
-func Decode(r *bufio.Reader) (InArray, error) {
-	arr, err := parseArray(r)
-	if err != nil {
-		return nil, err
-	}
-
-	return arr, nil
-}
-
-func parsePrefixedCount(r *bufio.Reader, prefix byte) (int, error) {
-	prefixedCount, err := r.ReadBytes('\n')
-	if err != nil {
-		return -1, err
-	}
-
-	if prefixedCount[0] != prefix {
-		return -1, fmt.Errorf("got %c, expected %c: %w", prefixedCount[0], prefix, ErrBadPrefix)
-	}
-	if len(prefixedCount) < 4 {
-		return -1, ErrNegativeCount
-	}
-
-	// trim \r\n
-	prefixedCount = prefixedCount[1 : len(prefixedCount)-2]
-	n, err := strconv.Atoi(string(prefixedCount))
-	if err != nil {
-		return -1, fmt.Errorf("got %q: %w", prefixedCount, ErrBadLength)
-	}
-
-	return n, nil
-}
-
-func parseArray(r *bufio.Reader) (InArray, error) {
+func ParseArray(r *bufio.Reader) (InArray, error) {
 	n, err := parsePrefixedCount(r, ArrayPrefix)
 	if err != nil {
 		return nil, err
 	}
 	if n < ArrayMinElems || n > ArrayMaxElems {
-		return nil, ErrBadLength
+		return nil, common.ErrBadLength
 	}
 
 	res := make([]BulkString, 0, n)
@@ -70,13 +40,36 @@ func parseArray(r *bufio.Reader) (InArray, error) {
 	return res, nil
 }
 
+func parsePrefixedCount(r *bufio.Reader, prefix byte) (int, error) {
+	prefixedCount, err := r.ReadBytes('\n')
+	if err != nil {
+		return -1, err
+	}
+
+	if prefixedCount[0] != prefix {
+		return -1, fmt.Errorf("got %c, expected %c: %w", prefixedCount[0], prefix, common.ErrBadPrefix)
+	}
+	if len(prefixedCount) < 4 {
+		return -1, common.ErrNegativeCount
+	}
+
+	// trim \r\n
+	prefixedCount = prefixedCount[1 : len(prefixedCount)-2]
+	n, err := strconv.Atoi(string(prefixedCount))
+	if err != nil {
+		return -1, fmt.Errorf("got %q: %w", prefixedCount, common.ErrBadLength)
+	}
+
+	return n, nil
+}
+
 func parseBulkString(r *bufio.Reader) (BulkString, error) {
 	n, err := parsePrefixedCount(r, BulkStringPrefix)
 	if err != nil {
 		return nil, err
 	}
 	if n < BulkStringMinBytes || n > BulkStringMaxBytes {
-		return nil, ErrBadLength
+		return nil, common.ErrBadLength
 	}
 
 	bs := make(BulkString, n)

@@ -1,4 +1,4 @@
-package main
+package resp
 
 import (
 	"bufio"
@@ -53,7 +53,7 @@ func TestDecode(t *testing.T) {
 			for rname, rfunc := range readerWrappers {
 				t.Run(rname, func(t *testing.T) {
 					r := bufio.NewReader(rfunc(strings.NewReader(tc.input)))
-					got, err := Decode(r)
+					got, err := ParseArray(r)
 					if tc.wantErr {
 						if err == nil {
 							t.Fatalf("expected error, got none")
